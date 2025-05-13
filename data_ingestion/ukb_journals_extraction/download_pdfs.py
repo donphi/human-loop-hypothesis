@@ -415,17 +415,47 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         # Generate filename and determine file type
         if metadata_parts and len(metadata_parts) >= 5:
             pub_id, doi, author, title, expected_file_type = metadata_parts
-            # Create a filename with the format: DOI_Author_Title.ext
-            # If DOI is empty or too short, use pub_id instead
-            if not doi or len(doi) < 3:
-                doi = pub_id
             
-            # Ensure the filename has a reasonable length
-            max_title_length = 40
-            if len(title) > max_title_length:
-                title = title[:max_title_length]
+            # Try to extract year from the index file
+            year = datetime.now().strftime('%Y')  # Default to current year
             
-            filename_base = f"{doi}_{author}_{title}"
+            # Load the index file if it hasn't been loaded yet
+            if not hasattr(download_file, 'index_loaded'):
+                download_file.index_loaded = True
+                download_file.publication_index = {}
+                index_file = os.path.join('/app/index', 'publications_index.json')
+                if os.path.exists(index_file):
+                    try:
+                        with open(index_file, 'r') as f:
+                            download_file.publication_index = json.load(f)
+                        logging.info(f"Loaded {len(download_file.publication_index)} publications from index file.")
+                    except Exception as e:
+                        logging.error(f"Error loading index file: {e}")
+            
+            # Try to find the publication in the index to get the year
+            for idx_pub_id, pub_data in getattr(download_file, 'publication_index', {}).items():
+                if pub_data.get('doi', '') == doi or idx_pub_id == pub_id:
+                    year = pub_data.get('year', year)
+                    break
+            
+            # Extract SHORT_ID from the DOI
+            short_id = doi
+            if '/' in doi:
+                # Try to extract the numeric part after the last slash or after parentheses
+                doi_parts = doi.split('/')[-1]
+                # Handle cases like (15)60175-1
+                if '(' in doi_parts and ')' in doi_parts:
+                    match = re.search(r'\)(\d+(-\d+)?)', doi_parts)
+                    if match:
+                        short_id = match.group(1)
+                else:
+                    # Extract numeric parts
+                    match = re.search(r'(\d+(-\d+)?)', doi_parts)
+                    if match:
+                        short_id = match.group(1)
+            
+            # Create a filename with the format: Year_Author_ShortID.ext
+            filename_base = f"{year}_{author}_{short_id}"
         else:
             # For URLs without metadata, try to extract information from the index file
             # Load the index file if it hasn't been loaded yet
