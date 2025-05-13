@@ -637,8 +637,17 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         temp_filepath = os.path.join(BASE_DIR, f"temp_{url_hash}")
         
         logging.info(f"Downloading {url} to temporary file...")
+        
+        # Add browser-like User-Agent for URLs with printable or render parameters
+        headers = {}
+        if "printable" in url.lower() or "render" in url.lower():
+            logging.info(f"Using browser-like User-Agent for URL with printable/render parameter")
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
+        
         # Allow redirects and set a reasonable timeout
-        response = requests.get(url, stream=True, timeout=30, allow_redirects=True)
+        response = requests.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True)
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
         
         # For HTML content, check if it's a redirect page and follow the redirect if needed
@@ -747,6 +756,61 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         return True  # Indicate success
     
     except requests.exceptions.RequestException as e:
+        # For printable/render URLs, try curl as a fallback
+        if "printable" in url.lower() or "render" in url.lower():
+            logging.info(f"Requests download failed for printable/render URL. Trying curl fallback: {url}")
+            try:
+                import subprocess
+                
+                # Use curl with browser-like user agent and follow redirects
+                curl_cmd = [
+                    'curl', '-L',
+                    '-A', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    url,
+                    '-o', temp_filepath
+                ]
+                
+                # Execute curl command
+                subprocess.run(curl_cmd, check=True)
+                
+                # Verify the file was downloaded and is not empty
+                if os.path.getsize(temp_filepath) == 0:
+                    os.remove(temp_filepath)  # Remove empty file
+                    raise IOError("Downloaded file is empty")
+                
+                # Verify content quality
+                is_valid, reason = verify_content(temp_filepath, actual_file_type, verification_logger)
+                
+                # Move the file to its final location
+                os.rename(temp_filepath, filepath)
+                
+                # Update verification results
+                verification_results[original_url] = {
+                    'filepath': filepath,
+                    'expected_type': expected_file_type,
+                    'actual_type': actual_file_type,
+                    'is_valid': is_valid,
+                    'reason': reason,
+                    'size': os.path.getsize(filepath),
+                    'method': 'curl_fallback'
+                }
+                
+                # Update statistics
+                if is_valid:
+                    stats['verification']['valid_content'] += 1
+                else:
+                    stats['verification']['invalid_content'] += 1
+                
+                downloaded_urls.add(original_url)
+                stats['successful_downloads'] += 1
+                logging.info(f"Successfully downloaded {url} to {filepath} using curl fallback")
+                logging.info(f"Content verification: {'VALID' if is_valid else 'INVALID'} - {reason}")
+                return True  # Indicate success
+                
+            except Exception as curl_e:
+                logging.error(f"Curl fallback also failed for {url}: {curl_e}")
+                # Continue to the standard failure handling
+        
         stats['failed_downloads'] += 1
         error_msg = f"Error downloading {url}: {e}"
         logging.error(error_msg)
