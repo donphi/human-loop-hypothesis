@@ -21,26 +21,28 @@ STATE_FILE = '/app/download_state.json'
 BASE_DIR = '/app/data'
 LOGS_DIR = '/app/logs'
 FAILED_DOWNLOADS_LOG = os.path.join(LOGS_DIR, 'failed_downloads.log')
+SCIHUB_ATTEMPTS_LOG = os.path.join(LOGS_DIR, 'scihub_attempts.log')
 STATS_FILE = os.path.join(LOGS_DIR, 'download_stats.json')
 CONTENT_VERIFICATION_LOG = os.path.join(LOGS_DIR, 'content_verification.log')
 DEFAULT_RATE_LIMIT = 5  # Default max concurrent downloads
 DEFAULT_DELAY = 1.0  # Default delay between downloads in seconds
 MIN_PDF_SIZE = 10 * 1024  # Minimum size for a valid PDF (10KB)
 MIN_TEXT_CONTENT = 1000  # Minimum number of characters for valid text content
+DEFAULT_SCIHUB_RATE_LIMIT_DELAY = 5  # Default delay between Sci-Hub requests in seconds
 
 # File type directories
 FILE_TYPE_DIRS = {
     'pdf': os.path.join(BASE_DIR, 'pdf'),
-    'html': os.path.join(BASE_DIR, 'html'),
-    'xml': os.path.join(BASE_DIR, 'xml'),
-    'doc': os.path.join(BASE_DIR, 'doc'),
-    'txt': os.path.join(BASE_DIR, 'txt'),
-    'unknown': os.path.join(BASE_DIR, 'unknown')
+    'sci_pdf': os.path.join(BASE_DIR, 'sci_pdf')
 }
+
+# Create a logs directory within sci_pdf for Sci-Hub specific logs
+SCIHUB_LOGS_DIR = os.path.join(FILE_TYPE_DIRS['sci_pdf'], 'logs')
 
 # Global variables
 downloaded_urls = set()
 failed_urls = set()
+scihub_attempted_urls = set()
 verification_results = {}
 start_time = None
 stats = {
@@ -49,6 +51,9 @@ stats = {
     'successful_downloads': 0,
     'failed_downloads': 0,
     'skipped_downloads': 0,
+    'scihub_attempts': 0,
+    'scihub_successes': 0,
+    'scihub_failures': 0,
     'start_time': None,
     'end_time': None,
     'elapsed_time': None,
@@ -61,10 +66,14 @@ stats = {
     }
 }
 
+# Sci-Hub domains to try
+SCIHUB_DOMAINS = []
+
 # Set up logging
 def setup_logging():
     """Set up logging configuration."""
     os.makedirs(LOGS_DIR, exist_ok=True)
+    os.makedirs(SCIHUB_LOGS_DIR, exist_ok=True)
     
     # Configure root logger
     logging.basicConfig(
@@ -83,6 +92,13 @@ def setup_logging():
     failed_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     failed_logger.addHandler(failed_handler)
     
+    # Create a separate logger for Sci-Hub attempts
+    scihub_logger = logging.getLogger('scihub_attempts')
+    scihub_logger.setLevel(logging.INFO)
+    scihub_handler = logging.FileHandler(SCIHUB_ATTEMPTS_LOG)
+    scihub_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    scihub_logger.addHandler(scihub_handler)
+    
     # Create a separate logger for content verification
     verification_logger = logging.getLogger('content_verification')
     verification_logger.setLevel(logging.INFO)
@@ -90,7 +106,7 @@ def setup_logging():
     verification_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     verification_logger.addHandler(verification_handler)
     
-    return failed_logger, verification_logger
+    return failed_logger, scihub_logger, verification_logger
 
 # Load and save state functions
 def load_state():
@@ -171,36 +187,8 @@ atexit.register(save_verification_results)
 
 def detect_content_type(response):
     """Detect the content type from the response headers and content."""
-    # First check the Content-Type header
-    content_type = response.headers.get('Content-Type', '').lower()
-    
-    if 'application/pdf' in content_type:
-        return 'pdf'
-    elif 'text/html' in content_type:
-        return 'html'
-    elif 'text/xml' in content_type or 'application/xml' in content_type:
-        return 'xml'
-    elif 'application/msword' in content_type or 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' in content_type:
-        return 'doc'
-    elif 'text/plain' in content_type:
-        return 'txt'
-    
-    # If header is not conclusive, try to guess from the first few bytes
-    try:
-        content_start = response.content[:1024]
-        if content_start.startswith(b'%PDF'):
-            return 'pdf'
-        elif b'<!DOCTYPE HTML' in content_start or b'<html' in content_start:
-            return 'html'
-        elif b'<?xml' in content_start:
-            return 'xml'
-        elif b'PK\x03\x04' in content_start:  # DOCX files are ZIP archives
-            return 'doc'
-    except:
-        pass
-    
-    # Default to unknown
-    return 'unknown'
+    # Always return 'pdf' since we're only handling PDFs now
+    return 'pdf'
 
 def verify_pdf_content(filepath, verification_logger):
     """Verify that a PDF file contains actual content and is not just a redirect or empty file."""
@@ -314,104 +302,364 @@ def extract_redirect_url(html_content, base_url=None):
         logging.error(f"Error extracting redirect URL: {e}")
         return None
 
-def verify_html_content(filepath, verification_logger):
-    """Verify that an HTML file contains actual content and is not just a redirect or error page."""
-    try:
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-        
-        # Check for minimum content length
-        if len(content) < MIN_TEXT_CONTENT:
-            verification_logger.info(f"HTML content too short ({len(content)} chars): {filepath}")
-            return False, f"Content too short: {len(content)} characters"
-        
-        # Parse HTML
-        soup = BeautifulSoup(content, 'html.parser')
-        
-        # Check for redirect meta tags
-        meta_refresh = soup.find('meta', attrs={'http-equiv': re.compile(r'refresh', re.I)})
-        if meta_refresh:
-            verification_logger.info(f"HTML contains redirect meta tag: {filepath}")
-            return False, "Contains redirect meta tag"
-        
-        # Check for redirect in URL parameters
-        if 'Redirect=' in content or 'articleSelectPrefsTemp' in content:
-            verification_logger.info(f"HTML appears to be a redirect page: {filepath}")
-            return False, "Appears to be a redirect page"
-        
-        # Check for common error page indicators
-        title = soup.title.text.lower() if soup.title else ""
-        if any(err in title for err in ['error', '404', 'not found', 'redirect']):
-            verification_logger.info(f"HTML appears to be an error page: {filepath}")
-            return False, f"Appears to be an error page: {title}"
-        
-        # Check for actual content
-        body_text = soup.body.get_text(strip=True) if soup.body else ""
-        if len(body_text) < MIN_TEXT_CONTENT:
-            verification_logger.info(f"HTML body has insufficient text ({len(body_text)} chars): {filepath}")
-            return False, f"Insufficient body text: {len(body_text)} characters"
-        
-        verification_logger.info(f"Valid HTML content: {filepath}")
-        return True, "Valid HTML content"
-        
-    except Exception as e:
-        verification_logger.info(f"Error verifying HTML {filepath}: {e}")
-        return False, f"Error verifying: {e}"
-
 def verify_content(filepath, file_type, verification_logger):
     """Verify that the downloaded file contains valid, useful content."""
-    if file_type == 'pdf':
-        return verify_pdf_content(filepath, verification_logger)
-    elif file_type == 'html':
-        return verify_html_content(filepath, verification_logger)
-    elif file_type in ['xml', 'txt']:
-        # Basic check for text files
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            if len(content) < MIN_TEXT_CONTENT:
-                verification_logger.info(f"{file_type.upper()} content too short ({len(content)} chars): {filepath}")
-                return False, f"Content too short: {len(content)} characters"
-            verification_logger.info(f"Valid {file_type.upper()} content: {filepath}")
-            return True, f"Valid {file_type.upper()} content"
-        except Exception as e:
-            verification_logger.info(f"Error verifying {file_type.upper()} {filepath}: {e}")
-            return False, f"Error verifying: {e}"
-    else:
-        # For other file types, just check if the file exists and is not empty
-        try:
-            file_size = os.path.getsize(filepath)
-            if file_size < 100:  # Arbitrary minimum size
-                verification_logger.info(f"File too small ({file_size} bytes): {filepath}")
-                return False, f"File too small: {file_size} bytes"
-            verification_logger.info(f"File exists with size {file_size} bytes: {filepath}")
-            return True, f"File exists with size {file_size} bytes"
-        except Exception as e:
-            verification_logger.info(f"Error checking file {filepath}: {e}")
-            return False, f"Error checking file: {e}"
+    return verify_pdf_content(filepath, verification_logger)
 
-def download_file(url, delay=0, failed_logger=None, verification_logger=None):
-    """Downloads a file from the given URL with content verification."""
-    global stats, verification_results
+def download_from_scihub(doi, output_path, scihub_logger, verification_logger, rate_limit_delay=DEFAULT_SCIHUB_RATE_LIMIT_DELAY):
+    """Download a paper from Sci-Hub using direct form submission."""
+    global stats
     
-    if url in downloaded_urls:
-        logging.info(f"Skipping {url}: already downloaded.")
+    if not doi:
+        scihub_logger.info(f"No DOI found, cannot use Sci-Hub")
+        return False
+    
+    scihub_logger.info(f"Attempting to download DOI {doi} from Sci-Hub")
+    stats['scihub_attempts'] += 1
+    
+    # Apply rate limiting
+    time.sleep(rate_limit_delay)
+    
+    # Set up session with browser-like headers
+    session = requests.Session()
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Origin': 'https://sci-hub.se',
+        'Referer': 'https://sci-hub.se/'
+    }
+    
+    for scihub_url in SCIHUB_DOMAINS:
+        try:
+            scihub_logger.info(f"Trying Sci-Hub domain: {scihub_url}")
+            
+            # First get the main page to get any cookies
+            main_response = session.get(scihub_url, headers=headers, timeout=10)
+            
+            if main_response.status_code != 200:
+                time.sleep(5)
+                scihub_logger.info(f"Failed to access {scihub_url}: {main_response.status_code}")
+                continue
+            
+            scihub_logger.info(f"Successfully accessed {scihub_url}")
+            
+            # Submit the DOI
+            data = {
+                'request': doi,
+                'sci-hub-plugin-check': ''
+            }
+            
+            response = session.post(scihub_url, data=data, headers=headers, timeout=10)
+            
+            if response.status_code != 200:
+                time.sleep(15)
+                scihub_logger.info(f"Failed to submit DOI to {scihub_url}: {response.status_code}")
+                continue
+            
+            scihub_logger.info(f"Successfully submitted DOI to {scihub_url}")
+            
+            # Save the response HTML for debugging
+            debug_path = os.path.join(SCIHUB_LOGS_DIR, f"debug_response_{doi.replace('/', '_')}.html")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(response.text)
+            scihub_logger.info(f"Saved response HTML to {debug_path}")
+            
+            # Parse the response to find the PDF
+            soup = BeautifulSoup(response.text, 'html.parser')
+            
+            # Look for the PDF iframe
+            iframe = soup.find('iframe')
+            if iframe and iframe.get('src'):
+                pdf_url = iframe.get('src')
+                scihub_logger.info(f"Found PDF URL in iframe: {pdf_url}")
+                
+                # If the PDF URL is relative, make it absolute
+                if pdf_url.startswith('//'):
+                    pdf_url = 'https:' + pdf_url
+                elif not pdf_url.startswith(('http://', 'https://')):
+                    pdf_url = scihub_url + ('/' if not pdf_url.startswith('/') else '') + pdf_url
+                
+                # Download the PDF
+                scihub_logger.info(f"Downloading PDF from {pdf_url}")
+                pdf_response = session.get(pdf_url, headers=headers, stream=True)
+                
+                if pdf_response.status_code != 200:
+                    scihub_logger.info(f"Failed to download PDF: {pdf_response.status_code}")
+                    continue
+                
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                
+                # Save the PDF
+                with open(output_path, 'wb') as f:
+                    for chunk in pdf_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verify the content
+                is_valid, reason = verify_content(output_path, 'sci_pdf', verification_logger)
+                
+                if is_valid:
+                    scihub_logger.info(f"Successfully downloaded PDF to {output_path}")
+                    stats['scihub_successes'] += 1
+                    return True
+                else:
+                    scihub_logger.info(f"Downloaded file is not a valid PDF: {reason}")
+                    # Try the next method or domain
+            
+            # If no iframe, look for download links
+            download_links = []
+            for link in soup.find_all('a'):
+                href = link.get('href', '')
+                if href.endswith('.pdf') or 'pdf' in href.lower():
+                    download_links.append(href)
+            
+            if download_links:
+                pdf_url = download_links[0]
+                scihub_logger.info(f"Found PDF download link: {pdf_url}")
+                
+                # If the PDF URL is relative, make it absolute
+                if pdf_url.startswith('//'):
+                    pdf_url = 'https:' + pdf_url
+                elif not pdf_url.startswith(('http://', 'https://')):
+                    pdf_url = scihub_url + ('/' if not pdf_url.startswith('/') else '') + pdf_url
+                
+                # Download the PDF
+                pdf_response = session.get(pdf_url, headers=headers, stream=True)
+                
+                if pdf_response.status_code != 200:
+                    scihub_logger.info(f"Failed to download PDF: {pdf_response.status_code}")
+                    continue
+                
+                # Ensure the directory exists
+                os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                
+                # Save the PDF
+                with open(output_path, 'wb') as f:
+                    for chunk in pdf_response.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                
+                # Verify the content
+                is_valid, reason = verify_content(output_path, 'sci_pdf', verification_logger)
+                
+                if is_valid:
+                    scihub_logger.info(f"Successfully downloaded PDF to {output_path}")
+                    stats['scihub_successes'] += 1
+                    return True
+                else:
+                    scihub_logger.info(f"Downloaded file is not a valid PDF: {reason}")
+                    # Try the next method or domain
+            
+            # If no iframe or download link, look for embed tag within article div
+            article_div = soup.find('div', id='article')
+            if article_div:
+                embed_tag = article_div.find('embed')
+                if embed_tag and embed_tag.get('src'):
+                    pdf_url = embed_tag.get('src')
+                    scihub_logger.info(f"Found PDF URL in embed tag: {pdf_url}")
+
+                    # If the PDF URL is relative, make it absolute
+                    if pdf_url.startswith('//'):
+                        pdf_url = 'https:' + pdf_url
+                    elif not pdf_url.startswith(('http://', 'https://')):
+                        pdf_url = scihub_url + ('/' if not pdf_url.startswith('/') else '') + pdf_url
+
+                    # Download the PDF
+                    pdf_response = session.get(pdf_url, headers=headers, stream=True)
+
+                    if pdf_response.status_code != 200:
+                        scihub_logger.info(f"Failed to download PDF: {pdf_response.status_code}")
+                        continue
+
+                    # Ensure the directory exists
+                    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+
+                    # Save the PDF
+                    with open(output_path, 'wb') as f:
+                        for chunk in pdf_response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+
+                    # Verify the content
+                    is_valid, reason = verify_content(output_path, 'sci_pdf', verification_logger)
+                    
+                    if is_valid:
+                        scihub_logger.info(f"Successfully downloaded PDF to {output_path}")
+                        stats['scihub_successes'] += 1
+                        return True
+                    else:
+                        scihub_logger.info(f"Downloaded file is not a valid PDF: {reason}")
+                        # Try the next method or domain
+
+            # If still no PDF found, try to extract from JavaScript
+            script_tags = soup.find_all('script')
+            for script in script_tags:
+                if script.string:
+                    pdf_matches = re.findall(r'https?://[^\s\'"]+\.pdf', script.string)
+                    if pdf_matches:
+                        pdf_url = pdf_matches[0]
+                        scihub_logger.info(f"Found PDF URL in script: {pdf_url}")
+                        
+                        # Download the PDF
+                        pdf_response = session.get(pdf_url, headers=headers, stream=True)
+                        
+                        if pdf_response.status_code != 200:
+                            scihub_logger.info(f"Failed to download PDF: {pdf_response.status_code}")
+                            continue
+                        
+                        # Ensure the directory exists
+                        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+                        
+                        # Save the PDF
+                        with open(output_path, 'wb') as f:
+                            for chunk in pdf_response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    f.write(chunk)
+                        
+                        # Verify the content
+                        is_valid, reason = verify_content(output_path, 'sci_pdf', verification_logger)
+                        
+                        if is_valid:
+                            scihub_logger.info(f"Successfully downloaded PDF to {output_path}")
+                            stats['scihub_successes'] += 1
+                            return True
+                        else:
+                            scihub_logger.info(f"Downloaded file is not a valid PDF: {reason}")
+                            # Try the next method or domain
+            
+            scihub_logger.info(f"Could not find PDF on {scihub_url}")
+            
+        except Exception as e:
+            scihub_logger.info(f"Error with {scihub_url}: {e}")
+    
+    scihub_logger.info("All Sci-Hub domains failed")
+    stats['scihub_failures'] += 1
+    return False
+
+def download_file(url_info, delay=0, failed_logger=None, scihub_logger=None, verification_logger=None, scihub_delay=DEFAULT_SCIHUB_RATE_LIMIT_DELAY):
+    """Downloads a file from the given URL with content verification, falling back to Sci-Hub if needed."""
+    global stats, verification_results, downloaded_urls, scihub_attempted_urls
+    
+    # Parse URL info
+    if '|http' in url_info:
+        parts = url_info.split('|')
+        url = parts[-1]  # The actual URL is the last part
+        metadata_parts = parts[:-1]  # All parts except the last one
+    else:
+        url = url_info
+        metadata_parts = None
+    
+    original_url = url_info
+    
+    if url_info in downloaded_urls:
+        logging.info(f"Skipping {url_info}: already downloaded.")
         stats['skipped_downloads'] += 1
         return False  # Indicate skipped
+    
+    # Extract DOI and file type from metadata parts
+    doi = None
+    expected_file_type = None
+    
+    if metadata_parts and len(metadata_parts) >= 5:
+        pub_id, doi, author, title, expected_file_type = metadata_parts
+    elif metadata_parts and len(metadata_parts) >= 2:
+        doi = metadata_parts[1]
+        expected_file_type = metadata_parts[4] if len(metadata_parts) >= 5 else None
+    
+    # If URL doesn't end with .pdf, doesn't contain 'render' or 'printable', and a DOI is available,
+    # go directly to Sci-Hub method
+    if doi and not url.lower().endswith('.pdf') and 'render' not in url.lower() and 'printable' not in url.lower():
+        logging.info(f"URL {url} is not a direct PDF download. Trying Sci-Hub with DOI {doi}")
+        
+        # Generate filename for Sci-Hub download
+        if metadata_parts and len(metadata_parts) >= 3:
+            pub_id, doi_str, author = metadata_parts[:3]
+            
+            # Try to extract year from the index file
+            year = datetime.now().strftime('%Y')  # Default to current year
+            
+            # Load the index file if it hasn't been loaded yet
+            if not hasattr(download_file, 'index_loaded'):
+                download_file.index_loaded = True
+                download_file.publication_index = {}
+                index_file = os.path.join('/app/index', 'publications_index.json')
+                if os.path.exists(index_file):
+                    try:
+                        with open(index_file, 'r') as f:
+                            download_file.publication_index = json.load(f)
+                        logging.info(f"Loaded {len(download_file.publication_index)} publications from index file.")
+                    except Exception as e:
+                        logging.error(f"Error loading index file: {e}")
+            
+            # Try to find the publication in the index to get the year
+            for idx_pub_id, pub_data in getattr(download_file, 'publication_index', {}).items():
+                if pub_data.get('doi', '') == doi_str or idx_pub_id == pub_id:
+                    year = pub_data.get('year', year)
+                    break
+            
+            # Extract SHORT_ID from the DOI
+            short_id = doi_str
+            if '/' in doi_str:
+                # Try to extract the numeric part after the last slash or after parentheses
+                doi_parts = doi_str.split('/')[-1]
+                # Handle cases like (15)60175-1
+                if '(' in doi_parts and ')' in doi_parts:
+                    match = re.search(r'\)(\d+(-\d+)?)', doi_parts)
+                    if match:
+                        short_id = match.group(1)
+                else:
+                    # Extract numeric parts
+                    match = re.search(r'(\d+(-\d+)?)', doi_parts)
+                    if match:
+                        short_id = match.group(1)
+            
+            # Create a filename with the format: Year_Author_ShortID.pdf
+            filename_base = f"{year}_{author}_{short_id}"
+            
+            # Clean up filename
+            filename_base = filename_base.replace('?', '_').replace('&', '_').replace('=', '_')
+            filename_base = filename_base.replace('(', '[').replace(')', ']')
+            filename_base = re.sub(r'_+', '_', filename_base)
+            
+            # Limit the base filename length to avoid path length issues
+            max_base_length = 40
+            if len(filename_base) > max_base_length:
+                filename_base = filename_base[:max_base_length]
+                # Remove trailing underscores or punctuation
+                filename_base = re.sub(r'[_\-.,;:]+$', '', filename_base)
+            
+            output_path = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"{filename_base}.pdf")
+        else:
+            # Generate a simple filename using the DOI
+            doi_cleaned = doi.replace('/', '_').replace('.', '_')
+            output_path = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"scihub_{doi_cleaned}.pdf")
+        
+        # Attempt Sci-Hub download
+        scihub_attempted_urls.add(original_url)
+        success = download_from_scihub(doi, output_path, scihub_logger, verification_logger, scihub_delay)
+        
+        if success:
+            downloaded_urls.add(original_url)
+            stats['successful_downloads'] += 1
+            logging.info(f"Successfully downloaded {url} from Sci-Hub to {output_path}")
+            return True  # Indicate success
+        else:
+            stats['failed_downloads'] += 1
+            error_msg = f"Failed to download {url} from Sci-Hub"
+            logging.error(error_msg)
+            if failed_logger:
+                failed_logger.error(f"{original_url} - Failed Sci-Hub download for DOI {doi}")
+            failed_urls.add(original_url)
+            return False  # Indicate failure
     
     # Apply rate limiting delay if specified
     if delay > 0:
         time.sleep(delay)
     
+    # Regular download attempt for PDF, render, or printable URLs
     try:
-        # Check if the URL has associated metadata (from the new format of extracted_urls.txt)
-        metadata_parts = None
-        original_url = url
-        if '|http' in url:
-            parts = url.split('|')
-            metadata_parts = parts[:-1]  # All parts except the last one (which is the URL)
-            url = parts[-1]  # The actual URL is the last part
-        
         # Generate filename and determine file type
         if metadata_parts and len(metadata_parts) >= 5:
             pub_id, doi, author, title, expected_file_type = metadata_parts
@@ -586,26 +834,12 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
                     filename_base = filename_base[:max_filename_length]
                 
                 # Try to guess file type from URL
-                expected_file_type = 'unknown'
-                if url.lower().endswith('.pdf'):
-                    expected_file_type = 'pdf'
-                elif url.lower().endswith(('.html', '.htm')):
-                    expected_file_type = 'html'
-                elif url.lower().endswith('.xml'):
-                    expected_file_type = 'xml'
-            # Clean up filename
-            if not filename_base or len(filename_base) < 5:
-                # Generate a filename if not available or invalid
-                filename_base = f"downloaded_file_{len(downloaded_urls) + 1}"
-            
-            # Try to guess file type from URL
-            expected_file_type = 'unknown'
-            if url.lower().endswith('.pdf'):
                 expected_file_type = 'pdf'
-            elif url.lower().endswith(('.html', '.htm')):
-                expected_file_type = 'html'
-            elif url.lower().endswith('.xml'):
-                expected_file_type = 'xml'
+            
+        # Clean up filename
+        if not filename_base or len(filename_base) < 5:
+            # Generate a filename if not available or invalid
+            filename_base = f"downloaded_file_{len(downloaded_urls) + 1}"
         
         # Decode HTML entities if present
         try:
@@ -627,7 +861,7 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         # Remove any duplicate underscores
         filename_base = re.sub(r'_+', '_', filename_base)
         
-        # Create directories for each file type if they don't exist
+        # Create directories if they don't exist
         for dir_path in FILE_TYPE_DIRS.values():
             os.makedirs(dir_path, exist_ok=True)
         
@@ -650,26 +884,6 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         response = requests.get(url, headers=headers, stream=True, timeout=30, allow_redirects=True)
         response.raise_for_status()  # Raise an HTTPError for bad responses (4xx or 5xx)
         
-        # For HTML content, check if it's a redirect page and follow the redirect if needed
-        content_type = response.headers.get('Content-Type', '').lower()
-        if 'text/html' in content_type or 'application/xhtml+xml' in content_type:
-            # Get the first chunk to check for redirects
-            content_preview = next(response.iter_content(chunk_size=8192), b'')
-            response_text = content_preview.decode('utf-8', errors='ignore')
-            
-            # Check if this is a redirect page
-            redirect_url = extract_redirect_url(response_text, url)
-            if redirect_url:
-                logging.info(f"Found redirect URL in HTML content: {redirect_url}")
-                
-                # Close the current response
-                response.close()
-                
-                # Follow the redirect URL
-                logging.info(f"Following redirect to: {redirect_url}")
-                response = requests.get(redirect_url, stream=True, timeout=30, allow_redirects=True)
-                response.raise_for_status()
-        
         # Detect actual content type from response
         actual_file_type = detect_content_type(response)
         
@@ -677,36 +891,16 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         stats['file_types'][actual_file_type] = stats['file_types'].get(actual_file_type, 0) + 1
         
         # Determine final file extension and path
-        if actual_file_type == 'pdf':
-            ext = '.pdf'
-        elif actual_file_type == 'html':
-            ext = '.html'
-        elif actual_file_type == 'xml':
-            ext = '.xml'
-        elif actual_file_type == 'doc':
-            ext = '.docx' if 'openxmlformats' in response.headers.get('Content-Type', '') else '.doc'
-        elif actual_file_type == 'txt':
-            ext = '.txt'
-        else:
-            # Try to get extension from URL or use .bin
-            url_ext = os.path.splitext(urlparse(url).path)[1]
-            ext = url_ext if url_ext else '.bin'
+        ext = '.pdf'  # Always PDF for now
         
-        # Ensure filename has the correct extension and is not too long
-        # Limit the base filename length to avoid path length issues
-        max_base_length = 40
-        if len(filename_base) > max_base_length:
-            filename_base = filename_base[:max_base_length]
-            # Remove trailing underscores or punctuation
-            filename_base = re.sub(r'[_\-.,;:]+$', '', filename_base)
-            
+        # Ensure filename has the correct extension
         if not filename_base.lower().endswith(ext.lower()):
             filename = filename_base + ext
         else:
             filename = filename_base
         
-        # Determine final filepath based on detected file type
-        filepath = os.path.join(FILE_TYPE_DIRS.get(actual_file_type, FILE_TYPE_DIRS['unknown']), filename)
+        # Determine final filepath
+        filepath = os.path.join(FILE_TYPE_DIRS['pdf'], filename)
         
         # Download the file with progress bar for large files
         total_size = int(response.headers.get('content-length', 0))
@@ -746,14 +940,38 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
         # Update statistics
         if is_valid:
             stats['verification']['valid_content'] += 1
+            downloaded_urls.add(original_url)
+            stats['successful_downloads'] += 1
+            logging.info(f"Successfully downloaded {url} to {filepath}")
+            logging.info(f"Content verification: {'VALID' if is_valid else 'INVALID'} - {reason}")
+            return True  # Indicate success
         else:
             stats['verification']['invalid_content'] += 1
-        
-        downloaded_urls.add(original_url)
-        stats['successful_downloads'] += 1
-        logging.info(f"Successfully downloaded {url} to {filepath}")
-        logging.info(f"Content verification: {'VALID' if is_valid else 'INVALID'} - {reason}")
-        return True  # Indicate success
+            # For invalid content, try Sci-Hub if DOI is available
+            if doi and doi not in scihub_attempted_urls:
+                logging.info(f"Downloaded content is invalid: {reason}. Trying Sci-Hub with DOI {doi}")
+                
+                # Generate filename for Sci-Hub download
+                doi_cleaned = doi.replace('/', '_').replace('.', '_')
+                scihub_filepath = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"{filename_base}.pdf")
+                
+                # Attempt Sci-Hub download
+                scihub_attempted_urls.add(doi)
+                success = download_from_scihub(doi, scihub_filepath, scihub_logger, verification_logger, scihub_delay)
+                
+                if success:
+                    downloaded_urls.add(original_url)
+                    stats['successful_downloads'] += 1
+                    logging.info(f"Successfully downloaded {url} from Sci-Hub to {scihub_filepath}")
+                    return True  # Indicate success
+            
+            # If no DOI or Sci-Hub attempt failed, mark as failed
+            stats['failed_downloads'] += 1
+            logging.error(f"Downloaded content is invalid and Sci-Hub attempt failed or not possible: {reason}")
+            if failed_logger:
+                failed_logger.error(f"{original_url} - Invalid content: {reason}")
+            failed_urls.add(original_url)
+            return False  # Indicate failure
     
     except requests.exceptions.RequestException as e:
         # For printable/render URLs, try curl as a fallback
@@ -779,7 +997,7 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
                     raise IOError("Downloaded file is empty")
                 
                 # Verify content quality
-                is_valid, reason = verify_content(temp_filepath, actual_file_type, verification_logger)
+                is_valid, reason = verify_content(temp_filepath, 'pdf', verification_logger)
                 
                 # Move the file to its final location
                 os.rename(temp_filepath, filepath)
@@ -788,7 +1006,7 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
                 verification_results[original_url] = {
                     'filepath': filepath,
                     'expected_type': expected_file_type,
-                    'actual_type': actual_file_type,
+                    'actual_type': 'pdf',
                     'is_valid': is_valid,
                     'reason': reason,
                     'size': os.path.getsize(filepath),
@@ -798,43 +1016,87 @@ def download_file(url, delay=0, failed_logger=None, verification_logger=None):
                 # Update statistics
                 if is_valid:
                     stats['verification']['valid_content'] += 1
+                    downloaded_urls.add(original_url)
+                    stats['successful_downloads'] += 1
+                    logging.info(f"Successfully downloaded {url} to {filepath} using curl fallback")
+                    logging.info(f"Content verification: {'VALID' if is_valid else 'INVALID'} - {reason}")
+                    return True  # Indicate success
                 else:
-                    stats['verification']['invalid_content'] += 1
-                
-                downloaded_urls.add(original_url)
-                stats['successful_downloads'] += 1
-                logging.info(f"Successfully downloaded {url} to {filepath} using curl fallback")
-                logging.info(f"Content verification: {'VALID' if is_valid else 'INVALID'} - {reason}")
-                return True  # Indicate success
+                    # For invalid content, try Sci-Hub if DOI is available
+                    if doi and doi not in scihub_attempted_urls:
+                        logging.info(f"Downloaded content is invalid: {reason}. Trying Sci-Hub with DOI {doi}")
+                        
+                        # Generate filename for Sci-Hub download
+                        doi_cleaned = doi.replace('/', '_').replace('.', '_')
+                        scihub_filepath = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"{filename_base}.pdf")
+                        
+                        # Attempt Sci-Hub download
+                        scihub_attempted_urls.add(doi)
+                        success = download_from_scihub(doi, scihub_filepath, scihub_logger, verification_logger, scihub_delay)
+                        
+                        if success:
+                            downloaded_urls.add(original_url)
+                            stats['successful_downloads'] += 1
+                            logging.info(f"Successfully downloaded {url} from Sci-Hub to {scihub_filepath}")
+                            return True  # Indicate success
                 
             except Exception as curl_e:
                 logging.error(f"Curl fallback also failed for {url}: {curl_e}")
                 # Continue to the standard failure handling
         
+        # If standard download and curl fallback failed, try Sci-Hub if DOI is available
+        if doi and doi not in scihub_attempted_urls:
+            logging.info(f"Standard download failed: {e}. Trying Sci-Hub with DOI {doi}")
+            
+            # Generate filename for Sci-Hub download
+            doi_cleaned = doi.replace('/', '_').replace('.', '_')
+            scihub_filepath = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"{filename_base if 'filename_base' in locals() else 'scihub_' + doi_cleaned}.pdf")
+            
+            # Attempt Sci-Hub download
+            scihub_attempted_urls.add(doi)
+            success = download_from_scihub(doi, scihub_filepath, scihub_logger, verification_logger, scihub_delay)
+            
+            if success:
+                downloaded_urls.add(original_url)
+                stats['successful_downloads'] += 1
+                logging.info(f"Successfully downloaded {url} from Sci-Hub to {scihub_filepath}")
+                return True  # Indicate success
+        
+        # If all methods failed, mark as failed
         stats['failed_downloads'] += 1
         error_msg = f"Error downloading {url}: {e}"
         logging.error(error_msg)
         if failed_logger:
-            failed_logger.error(f"{original_url if 'original_url' in locals() else url} - {e}")
-        failed_urls.add(original_url if 'original_url' in locals() else url)
-        return False  # Indicate failure
-    
-    except IOError as e:
-        stats['failed_downloads'] += 1
-        error_msg = f"Error writing file for {url}: {e}"
-        logging.error(error_msg)
-        if failed_logger:
-            failed_logger.error(f"{original_url if 'original_url' in locals() else url} - {e}")
-        failed_urls.add(original_url if 'original_url' in locals() else url)
+            failed_logger.error(f"{original_url} - {e}")
+        failed_urls.add(original_url)
         return False  # Indicate failure
     
     except Exception as e:
+        # If any other error occurs, try Sci-Hub if DOI is available
+        if doi and doi not in scihub_attempted_urls:
+            logging.info(f"Error processing {url}: {e}. Trying Sci-Hub with DOI {doi}")
+            
+            # Generate filename for Sci-Hub download
+            doi_cleaned = doi.replace('/', '_').replace('.', '_')
+            scihub_filepath = os.path.join(FILE_TYPE_DIRS['sci_pdf'], f"{filename_base if 'filename_base' in locals() else 'scihub_' + doi_cleaned}.pdf")
+            
+            # Attempt Sci-Hub download
+            scihub_attempted_urls.add(doi)
+            success = download_from_scihub(doi, scihub_filepath, scihub_logger, verification_logger, scihub_delay)
+            
+            if success:
+                downloaded_urls.add(original_url)
+                stats['successful_downloads'] += 1
+                logging.info(f"Successfully downloaded {url} from Sci-Hub to {scihub_filepath}")
+                return True  # Indicate success
+        
+        # If all methods failed, mark as failed
         stats['failed_downloads'] += 1
         error_msg = f"Unexpected error processing {url}: {e}"
         logging.error(error_msg)
         if failed_logger:
-            failed_logger.error(f"{original_url if 'original_url' in locals() else url} - {e}")
-        failed_urls.add(original_url if 'original_url' in locals() else url)
+            failed_logger.error(f"{original_url} - {e}")
+        failed_urls.add(original_url)
         return False  # Indicate failure
 
 def format_time(seconds):
@@ -862,6 +1124,11 @@ def print_summary():
     logging.info(f"Failed downloads: {stats['failed_downloads']}")
     logging.info(f"Skipped (previously downloaded): {stats['skipped_downloads']}")
     
+    logging.info("\nSci-Hub statistics:")
+    logging.info(f"  Attempts: {stats['scihub_attempts']}")
+    logging.info(f"  Successes: {stats['scihub_successes']}")
+    logging.info(f"  Failures: {stats['scihub_failures']}")
+    
     logging.info("\nFile type statistics:")
     for file_type, count in stats['file_types'].items():
         logging.info(f"  {file_type}: {count}")
@@ -874,109 +1141,34 @@ def print_summary():
     logging.info(f"\nElapsed time: {elapsed_str}")
     logging.info("="*50)
     logging.info(f"Failed downloads are logged in: {FAILED_DOWNLOADS_LOG}")
+    logging.info(f"Sci-Hub attempts are logged in: {SCIHUB_ATTEMPTS_LOG}")
     logging.info(f"Content verification details are logged in: {CONTENT_VERIFICATION_LOG}")
     logging.info(f"Download statistics saved to: {STATS_FILE}")
     logging.info("="*50)
 
-def process_existing_html_redirects(verification_logger=None):
-    """
-    Process existing HTML files that contain redirects and replace them with the actual content.
-    This is useful for fixing previously downloaded HTML files that are just redirect pages.
-    """
-    html_dir = FILE_TYPE_DIRS.get('html')
-    if not os.path.exists(html_dir):
-        logging.info(f"HTML directory {html_dir} does not exist, skipping redirect processing.")
-        return
-    
-    logging.info(f"Checking for redirect HTML files in {html_dir}...")
-    redirect_files = []
-    
-    # Find HTML files that might be redirects
-    for filename in os.listdir(html_dir):
-        if not filename.endswith('.html'):
-            continue
-        
-        filepath = os.path.join(html_dir, filename)
-        try:
-            with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Check if this is a redirect file
-            if 'Redirect=' in content or 'articleSelectPrefsTemp' in content:
-                # Use the original URL from the index if available, otherwise use a default base
-                base_url = None
-                for pub_id, pub_data in getattr(download_file, 'publication_index', {}).items():
-                    if filename in pub_data.get('filepath', ''):
-                        base_url = pub_data.get('url')
-                        break
-                
-                redirect_url = extract_redirect_url(content, base_url)
-                if redirect_url:
-                    redirect_files.append((filepath, filename, redirect_url))
-        except Exception as e:
-            logging.error(f"Error checking HTML file {filepath}: {e}")
-    
-    if not redirect_files:
-        logging.info("No redirect HTML files found.")
-        return
-    
-    logging.info(f"Found {len(redirect_files)} HTML files with redirects. Processing...")
-    
-    # Process each redirect file
-    for filepath, filename, redirect_url in redirect_files:
-        logging.info(f"Processing redirect in {filename} to {redirect_url}")
-        
-        try:
-            # Download the actual content
-            response = requests.get(redirect_url, stream=True, timeout=30, allow_redirects=True)
-            response.raise_for_status()
-            
-            # Create a temporary file
-            temp_filepath = filepath + ".tmp"
-            
-            # Save the content to the temporary file
-            with open(temp_filepath, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            
-            # Verify the content
-            is_valid, reason = verify_content(temp_filepath, 'html', verification_logger)
-            
-            if is_valid:
-                # Replace the original file with the new content
-                os.replace(temp_filepath, filepath)
-                logging.info(f"Successfully replaced redirect file {filename} with actual content.")
-            else:
-                # If not valid, keep the original file but log the issue
-                os.remove(temp_filepath)
-                logging.warning(f"Downloaded content for {filename} was not valid: {reason}")
-        
-        except Exception as e:
-            logging.error(f"Error processing redirect in {filename}: {e}")
-
 def main():
-    # Declare globals at the beginning of the function
-    global DOWNLOAD_DIR, STATE_FILE, LOGS_DIR, FAILED_DOWNLOADS_LOG, STATS_FILE, BASE_DIR, FILE_TYPE_DIRS, stats
+    global BASE_DIR, STATE_FILE, LOGS_DIR, FAILED_DOWNLOADS_LOG, SCIHUB_ATTEMPTS_LOG, STATS_FILE, CONTENT_VERIFICATION_LOG, FILE_TYPE_DIRS, SCIHUB_LOGS_DIR
     
-    parser = argparse.ArgumentParser(description='Download files from a list of URLs with rate limiting, content verification, and resumable downloads.')
+    parser = argparse.ArgumentParser(description='Download files from a list of URLs with rate limiting, content verification, and resumable downloads. Falls back to Sci-Hub for non-PDF URLs or failed downloads.')
     parser.add_argument('url_list_file', help='Path to the file containing the list of URLs.')
     parser.add_argument('--max-concurrent', type=int, default=DEFAULT_RATE_LIMIT,
                         help=f'Maximum number of concurrent downloads. Default: {DEFAULT_RATE_LIMIT}')
     parser.add_argument('--delay', type=float, default=DEFAULT_DELAY,
                         help=f'Delay between downloads in seconds. Default: {DEFAULT_DELAY}')
+    parser.add_argument('--scihub-delay', type=float, default=DEFAULT_SCIHUB_RATE_LIMIT_DELAY,
+                        help=f'Delay between Sci-Hub requests in seconds. Default: {DEFAULT_SCIHUB_RATE_LIMIT_DELAY}')
     parser.add_argument('--base-dir', type=str, default=BASE_DIR,
                         help=f'Base directory to save downloaded files. Default: {BASE_DIR}')
     parser.add_argument('--state-file', type=str, default=STATE_FILE,
                         help=f'File to store download state. Default: {STATE_FILE}')
     parser.add_argument('--logs-dir', type=str, default=LOGS_DIR,
                         help=f'Directory to store log files. Default: {LOGS_DIR}')
-    parser.add_argument('--check-content-type', action='store_true',
-                        help='Check if URL points to a PDF before downloading.')
     parser.add_argument('--verify-content', action='store_true', default=True,
                         help='Verify that downloaded content is valid and useful.')
-    parser.add_argument('--process-redirects', action='store_true',
-                        help='Process existing HTML files that contain redirects and replace them with actual content.')
+    parser.add_argument('--disable-scihub', action='store_true',
+                        help='Disable Sci-Hub fallback for non-PDF URLs or failed downloads.')
+    parser.add_argument('--only-scihub', action='store_true',
+                        help='Only use Sci-Hub for downloading (requires DOIs in URL list).')
     
     args = parser.parse_args()
     
@@ -985,14 +1177,19 @@ def main():
     STATE_FILE = args.state_file
     LOGS_DIR = args.logs_dir
     FAILED_DOWNLOADS_LOG = os.path.join(LOGS_DIR, 'failed_downloads.log')
+    SCIHUB_ATTEMPTS_LOG = os.path.join(LOGS_DIR, 'scihub_attempts.log')
     STATS_FILE = os.path.join(LOGS_DIR, 'download_stats.json')
+    CONTENT_VERIFICATION_LOG = os.path.join(LOGS_DIR, 'content_verification.log')
     
     # Update file type directories
-    for file_type in FILE_TYPE_DIRS:
-        FILE_TYPE_DIRS[file_type] = os.path.join(BASE_DIR, file_type)
+    FILE_TYPE_DIRS['pdf'] = os.path.join(BASE_DIR, 'pdf')
+    FILE_TYPE_DIRS['sci_pdf'] = os.path.join(BASE_DIR, 'sci_pdf')
+    
+    # Create a logs directory within sci_pdf for Sci-Hub specific logs
+    SCIHUB_LOGS_DIR = os.path.join(FILE_TYPE_DIRS['sci_pdf'], 'logs')
     
     # Set up logging
-    failed_logger, verification_logger = setup_logging()
+    failed_logger, scihub_logger, verification_logger = setup_logging()
     
     # Initialize stats
     stats['start_time'] = datetime.now().isoformat()
@@ -1018,39 +1215,27 @@ def main():
     logging.info(f"Skipping {stats['skipped_downloads']} URLs that were previously downloaded.")
     logging.info(f"Attempting to download {len(urls_to_download)} new URLs.")
     
-    # Check if URLs are PDFs if requested
-    if args.check_content_type:
-        logging.info("Checking content types...")
-        pdf_urls = []
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
-            future_to_url = {executor.submit(is_pdf, url): url for url in urls_to_download}
-            for i, future in enumerate(concurrent.futures.as_completed(future_to_url)):
-                url = future_to_url[future]
-                try:
-                    is_pdf_result = future.result()
-                    if is_pdf_result:
-                        pdf_urls.append(url)
-                    if (i+1) % 10 == 0:  # Log progress every 10 URLs
-                        logging.info(f"Checked {i+1}/{len(urls_to_download)} URLs.")
-                except Exception as exc:
-                    logging.error(f'{url} generated an exception during check: {exc}')
-        
-        logging.info(f"Found {len(pdf_urls)} PDF URLs to download.")
-        urls_to_download = pdf_urls
-    
     stats['attempted_downloads'] = len(urls_to_download)
     
-    # Create base directory and file type subdirectories
-    os.makedirs(BASE_DIR, exist_ok=True)
+    # Create directories
     for dir_path in FILE_TYPE_DIRS.values():
         os.makedirs(dir_path, exist_ok=True)
+    os.makedirs(SCIHUB_LOGS_DIR, exist_ok=True)
     
     # Download the identified URLs with rate limiting
     if urls_to_download:
-        logging.info(f"Starting downloads with max {args.max_concurrent} concurrent downloads and {args.delay}s delay between downloads...")
+        logging.info(f"Starting downloads with max {args.max_concurrent} concurrent downloads, {args.delay}s delay between downloads, and {args.scihub_delay}s delay between Sci-Hub requests...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_concurrent) as executor:
             future_to_url = {
-                executor.submit(download_file, url, args.delay, failed_logger, verification_logger): url 
+                executor.submit(
+                    download_file, 
+                    url, 
+                    args.delay, 
+                    failed_logger, 
+                    scihub_logger, 
+                    verification_logger,
+                    args.scihub_delay
+                ): url 
                 for url in urls_to_download
             }
             
@@ -1064,11 +1249,6 @@ def main():
                         logging.error(f'{url} generated an exception: {exc}')
                     finally:
                         pbar.update(1)
-    
-    # Process existing HTML files with redirects if requested
-    if args.process_redirects:
-        logging.info("Processing existing HTML files with redirects...")
-        process_existing_html_redirects(verification_logger)
     
     # Print summary
     print_summary()

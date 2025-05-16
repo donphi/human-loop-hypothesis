@@ -12,6 +12,7 @@ This module automates the process of:
 3. Downloading only new publications when the source file is updated
 4. Downloading the corresponding files in a reliable, resumable manner
 5. Tracking download statistics and handling failures gracefully
+6. Using Sci-Hub as a fallback for non-PDF URLs or failed downloads
 
 The goal is to build and maintain a comprehensive corpus of UK Biobank research papers for further analysis, embedding generation, and hypothesis testing.
 
@@ -20,9 +21,10 @@ The goal is to build and maintain a comprehensive corpus of UK Biobank research 
 ## 🛠️ Key Features
 
 - **Incremental Updates**: Only processes new publications when you update the source file
-- **Multi-format Support**: Handles various file types (PDF, HTML, XML, DOC, TXT)
+- **PDF Focus**: Specializes in downloading PDF files, using both direct links and Sci-Hub
+- **Sci-Hub Integration**: Automatically falls back to Sci-Hub for non-PDF URLs or failed downloads
 - **Content Verification**: Validates that downloaded files contain actual, useful content
-- **Intelligent Organization**: Sorts files into directories by file type
+- **Intelligent Organization**: Sorts files into directories by source (direct download or Sci-Hub)
 - **Content Quality Assurance**: Identifies and flags redirects, error pages, and empty documents
 - **Intelligent Filename Generation**: Creates meaningful filenames using DOI, author, and title
 - **Metadata Extraction**: Extracts not just URLs but also publication metadata
@@ -43,7 +45,7 @@ The goal is to build and maintain a comprehensive corpus of UK Biobank research 
 ├── Dockerfile                # Docker container configuration
 ├── publications.txt          # Source data with journal metadata (must be downloaded)
 ├── README.md                 # This file
-├── download_pdfs.py          # Script to download PDFs from URLs
+├── download_pdfs.py          # Script to download PDFs from URLs and Sci-Hub
 ├── extract_urls.py           # Script to extract URLs from journal data
 ├── extracted_urls.txt        # Extracted URLs ready for downloading
 ├── kill_downloads.py         # Utility to terminate running download processes
@@ -54,15 +56,13 @@ The goal is to build and maintain a comprehensive corpus of UK Biobank research 
 │   ├── docker_guide.md       # Instructions for using Docker
 │   └── project_structure.md  # Explanation of project files and structure
 ├── data/                     # Base directory for downloaded files (created automatically)
-│   ├── pdf/                  # PDF files
-│   ├── html/                 # HTML files
-│   ├── xml/                  # XML files
-│   ├── doc/                  # Word documents
-│   ├── txt/                  # Text files
-│   └── unknown/              # Files with unrecognized formats
+│   ├── pdf/                  # PDF files from direct downloads
+│   └── sci_pdf/              # PDF files downloaded through Sci-Hub
+│       └── logs/             # Sci-Hub specific logs
 └── logs/                     # Directory for logs (created automatically)
     ├── download.log          # General log of all activities
     ├── failed_downloads.log  # Log of failed downloads with error details
+    ├── scihub_attempts.log   # Log of Sci-Hub download attempts
     ├── content_verification.log # Log of content verification results
     ├── download_stats.json   # Statistics about the download process
     └── verification_results.json # Detailed content verification results
@@ -78,6 +78,9 @@ The goal is to build and maintain a comprehensive corpus of UK Biobank research 
 - OR Python 3.6+ with required packages:
   - requests
   - tqdm
+  - python-magic
+  - PyPDF2
+  - beautifulsoup4
 
 ### Obtaining the Publications Data
 
@@ -140,6 +143,24 @@ When you want to update your collection with new publications:
 
 **Note**: The extraction step must be completed before running the download script.
 
+### Sci-Hub Integration
+
+The system now includes Sci-Hub integration for improved PDF retrieval:
+
+1. For direct PDF downloads (URLs ending with .pdf or containing 'render' or 'printable'):
+   - The system attempts to download directly from the source
+   - If the download fails or the content is invalid, it falls back to Sci-Hub using the DOI
+
+2. For non-PDF URLs (DOI links, journal pages, etc.):
+   - The system skips the direct download and goes straight to Sci-Hub
+   - It uses the DOI information from the extracted_urls.txt file
+
+3. The downloaded PDFs are stored in separate directories:
+   - `/data/pdf/` - PDFs downloaded directly from the source
+   - `/data/sci_pdf/` - PDFs downloaded through Sci-Hub
+
+4. Sci-Hub specific logs are stored in `/data/sci_pdf/logs/`
+
 ### Filtering Options
 
 The extract_urls.py script supports several filtering options:
@@ -158,14 +179,16 @@ python extract_urls.py --input custom_publications.txt --output custom_urls.txt 
 ### Customizing the Download Process
 
 ```bash
-python download_pdfs.py extracted_urls.txt --max-concurrent 3 --delay 2 --check-content-type
+python download_pdfs.py extracted_urls.txt --max-concurrent 3 --delay 2 --scihub-delay 5
 ```
 
 Options:
 - `--max-concurrent N`: Maximum number of concurrent downloads (default: 5)
 - `--delay N`: Delay between downloads in seconds (default: 1.0)
-- `--check-content-type`: Check if URL points to a PDF before downloading
-- `--download-dir PATH`: Directory to save downloaded PDFs
+- `--scihub-delay N`: Delay between Sci-Hub requests in seconds (default: 5.0)
+- `--disable-scihub`: Disable Sci-Hub fallback for non-PDF URLs or failed downloads
+- `--only-scihub`: Only use Sci-Hub for downloading (requires DOIs in URL list)
+- `--base-dir PATH`: Directory to save downloaded files
 - `--logs-dir PATH`: Directory to store log files
 
 ---
@@ -174,8 +197,11 @@ Options:
 
 - Check download progress in real-time in the terminal
 - View detailed logs in the `logs/` directory
-- Access downloaded files in the `data/` directory, organized by file type
+- Access downloaded files in the `data/` directory:
+  - `data/pdf/` - PDFs downloaded directly from the source
+  - `data/sci_pdf/` - PDFs downloaded through Sci-Hub
 - Review download statistics in `logs/download_stats.json`
+- Check Sci-Hub specific logs in `data/sci_pdf/logs/`
 
 ---
 
@@ -201,10 +227,10 @@ This module is part of the larger Human-in-the-Loop for Automated Hypothesis Tes
 
 ## 🧪 Future Improvements
 
-- Implement automatic retry mechanism for failed downloads
-- Add support for more document formats
 - Implement more sophisticated rate limiting based on domains
 - Integrate with citation management systems
 - Add OCR capabilities for scanned documents
 - Implement automatic alternative source finding for failed downloads
 - Add full-text extraction for all document types
+- Expand the list of Sci-Hub domains
+- Add support for proxy servers to improve access to restricted content

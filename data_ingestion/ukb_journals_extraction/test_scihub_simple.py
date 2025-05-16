@@ -22,16 +22,12 @@ def download_from_scihub(doi, output_path, rate_limit_delay=5):
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Origin': 'https://sci-hub.ee',
-        'Referer': 'https://sci-hub.ee/'
+        'Origin': 'https://sci-hub.se',
+        'Referer': 'https://sci-hub.se/'
     }
     
     # List of Sci-Hub domains to try
     scihub_domains = [
-        "https://sci-hub.ee",
-        "https://sci-hub.se",
-        "https://sci-hub.st",
-        "https://sci-hub.ru"
     ]
     
     for scihub_url in scihub_domains:
